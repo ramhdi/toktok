@@ -33,21 +33,22 @@ func main() {
 	}
 	defer broadcaster.Close()
 
+	// Get channels for SDP communication
+	broadcasterSDPChan := sigServer.GetBroadcasterSDPChan()
+	viewerSDPChan := sigServer.GetViewerSDPChan()
+
 	// Handle first connection (broadcaster)
 	log.Println("Waiting for broadcaster...")
 	offer := webrtc.SessionDescription{}
-	if err := utils.Decode(<-sigServer.GetSDPChan(), &offer); err != nil {
-		log.Fatalf("Failed to decode offer: %v", err)
-	} else {
-		log.Printf("Broadcaster offer = %v\n", offer)
+	if err := utils.Decode(<-broadcasterSDPChan, &offer); err != nil {
+		log.Fatalf("Failed to decode broadcaster offer: %v", err)
 	}
 
 	answer, err := broadcaster.Start(offer)
 	if err != nil {
 		log.Fatalf("Failed to start broadcaster: %v", err)
 	}
-	log.Println("Answer=")
-	log.Println(answer)
+	broadcasterSDPChan <- answer // Send answer back through channel
 
 	// Handle viewer connections
 	log.Println("Waiting for viewers...")
@@ -60,11 +61,9 @@ func main() {
 		for {
 			log.Println("\nWaiting for viewer offer...")
 			viewerOffer := webrtc.SessionDescription{}
-			if err := utils.Decode(<-sigServer.GetSDPChan(), &viewerOffer); err != nil {
+			if err := utils.Decode(<-viewerSDPChan, &viewerOffer); err != nil {
 				log.Printf("Failed to decode viewer offer: %v", err)
 				continue
-			} else {
-				log.Printf("Viewer offer = %v\n", viewerOffer)
 			}
 
 			viewer := stream.NewViewer(cfg.StunURL)
@@ -73,7 +72,7 @@ func main() {
 				log.Printf("Failed to start viewer: %v", err)
 				continue
 			}
-			log.Println(answer)
+			viewerSDPChan <- answer // Send answer back through channel
 		}
 	}()
 

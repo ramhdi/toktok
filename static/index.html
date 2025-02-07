@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC Demo</title>
+  <style>
+    video {
+      background: #ddd;
+      border-radius: 4px;
+      margin: 10px 0;
+    }
+
+    .status {
+      color: #666;
+      font-style: italic;
+      margin: 10px 0;
+    }
+  </style>
+</head>
+
+<body>
+  <div>
+    <video id="video1" width="160" height="120" autoplay muted playsinline></video>
+  </div>
+
+  <div>
+    <button class="createSessionButton" onclick="window.createSession(true)">Publish a Broadcast</button>
+    <button class="createSessionButton" onclick="window.createSession(false)">Join a Broadcast</button>
+  </div>
+
+  <div class="status" id="status">Not connected</div>
+  <div id="logs"></div>
+
+  <script>
+    let pc;
+    let ws;
+    const wsUrl = `ws://${window.location.hostname}:${window.location.port}/ws`;
+    // const wsUrl = `ws://localhost:8080/ws`;
+
+    const log = msg => {
+      document.getElementById('logs').innerHTML += msg + '<br>';
+    };
+
+    const setStatus = msg => {
+      document.getElementById('status').textContent = msg;
+    };
+
+    const initWebSocket = () => {
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        setStatus('WebSocket connected');
+      };
+
+      ws.onclose = () => {
+        setStatus('WebSocket disconnected');
+      };
+
+      ws.onerror = error => {
+        log('WebSocket error: ' + error);
+        setStatus('WebSocket error');
+      };
+
+      ws.onmessage = e => {
+        const msg = JSON.parse(e.data);
+        handleSignalingMessage(msg);
+      };
+    };
+
+    const handleSignalingMessage = async (msg) => {
+      switch (msg.type) {
+        case 'server-broadcaster-answer':
+        case 'server-viewer-answer':
+          try {
+            const sdp = JSON.parse(atob(msg.sdp));
+            await pc.setRemoteDescription(sdp);
+            setStatus('Connected to stream');
+          } catch (e) {
+            log('Error setting remote description: ' + e);
+          }
+          break;
+
+        case 'error':
+          log('Signaling error: ' + msg.sdp);
+          setStatus('Error: ' + msg.sdp);
+          break;
+      }
+    };
+
+    window.createSession = async (isPublisher) => {
+      // Initialize WebSocket first
+      initWebSocket();
+
+      // Create RTCPeerConnection
+      pc = new RTCPeerConnection({
+        iceServers: [
+          {
+            urls: 'stun:stun.l.google.com:19302'
+          }
+        ]
+      });
+
+      // Set up event handlers
+      pc.oniceconnectionstatechange = () => {
+        log('ICE Connection State: ' + pc.iceConnectionState);
+      };
+
+      pc.onicecandidate = event => {
+        if (event.candidate === null) {
+          // Send the SDP to the server when ICE gathering is complete
+          const sdp = btoa(JSON.stringify(pc.localDescription));
+          if (isPublisher) {
+            ws.send(JSON.stringify({
+              type: 'broadcaster-server-offer',
+              sdp: sdp
+            }));
+          } else {
+            ws.send(JSON.stringify({
+              type: 'viewer-server-offer',
+              sdp: sdp
+            }));
+          }
+        }
+      };
+
+      if (isPublisher) {
+        // Register as broadcaster first
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'register-broadcaster' }));
+          setStatus('Registering as broadcaster...');
+        };
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false
+          });
+
+          stream.getTracks().forEach(track => pc.addTrack(track, stream));
+          document.getElementById('video1').srcObject = stream;
+
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+
+          setStatus('Broadcasting...');
+        } catch (e) {
+          log('Error starting broadcast: ' + e);
+        }
+      } else {
+        // Register as viewer first
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: 'register-viewer' }));
+          setStatus('Registering as viewer...');
+        };
+
+        pc.addTransceiver('video');
+
+        pc.ontrack = function (event) {
+          const videoEl = document.getElementById('video1');
+          videoEl.srcObject = event.streams[0];
+          videoEl.autoplay = true;
+          videoEl.controls = true;
+          setStatus('Viewing broadcast');
+        };
+
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+        } catch (e) {
+          log('Error joining broadcast: ' + e);
+        }
+      }
+
+      // Hide buttons after selection
+      const btns = document.getElementsByClassName('createSessionButton');
+      for (let btn of btns) {
+        btn.style.display = 'none';
+      }
+    };
+  </script>
+</body>
+
+</html>
