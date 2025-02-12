@@ -7,7 +7,11 @@ import (
 	"net/http"
 	"sync"
 
+	"toktok/room"
+	"toktok/utils"
+
 	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v3"
 )
 
 type MessageType string
@@ -33,30 +37,28 @@ type Server struct {
 	// WebSocket upgrader
 	upgrader websocket.Upgrader
 
-	// Server state
-	broadcaster  *websocket.Conn
-	viewers      map[*websocket.Conn]bool
-	viewersMutex sync.RWMutex
-
-	// Channels for SDP handling
-	broadcasterSDPChan chan string
-	viewerSDPChan      chan string
+	// Default room (to maintain current behavior)
+	room *room.Room
 
 	// Server configuration
 	port int
+
+	// Connection tracking
+	mu           sync.RWMutex
+	viewerID     int
+	connToViewer map[*websocket.Conn]string // maps connection to viewerID
 }
 
-func NewServer(port int) *Server {
+func NewServer(port int, room *room.Room) *Server {
 	return &Server{
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins for testing
 			},
 		},
-		viewers:            make(map[*websocket.Conn]bool),
-		broadcasterSDPChan: make(chan string),
-		viewerSDPChan:      make(chan string),
-		port:               port,
+		room:         room,
+		port:         port,
+		connToViewer: make(map[*websocket.Conn]string),
 	}
 }
 
@@ -116,91 +118,134 @@ func (s *Server) handleMessage(conn *websocket.Conn, msg *Message) {
 }
 
 func (s *Server) handleBroadcasterRegister(conn *websocket.Conn) {
-	if s.broadcaster != nil {
+	if err := s.room.RegisterBroadcaster(conn); err != nil {
 		sendMessage(conn, Message{
 			Type: "error",
 			SDP:  "Broadcaster already exists",
 		})
 		return
 	}
-
-	s.broadcaster = conn
 	log.Println("Broadcaster registered")
 }
 
 func (s *Server) handleBroadcasterOffer(conn *websocket.Conn, sdp string) {
-	if conn != s.broadcaster {
+	// Decode the base64-encoded SDP
+	var offer webrtc.SessionDescription
+	if err := utils.Decode(sdp, &offer); err != nil {
 		sendMessage(conn, Message{
 			Type: "error",
-			SDP:  "Not authorized as broadcaster",
+			SDP:  fmt.Sprintf("Failed to decode SDP: %v", err),
 		})
 		return
 	}
 
-	s.broadcasterSDPChan <- sdp
-	answer := <-s.broadcasterSDPChan // Wait for answer from main process
+	answer, err := s.room.HandleBroadcasterOffer(offer.SDP)
+	if err != nil {
+		sendMessage(conn, Message{
+			Type: "error",
+			SDP:  fmt.Sprintf("Failed to handle broadcaster offer: %v", err),
+		})
+		return
+	}
+
+	// Encode the answer before sending
+	encodedAnswer := utils.Encode(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  answer,
+	})
 
 	sendMessage(conn, Message{
 		Type: ServerBroadcasterAnswer,
-		SDP:  answer,
+		SDP:  encodedAnswer,
 	})
 }
 
 func (s *Server) handleViewerRegister(conn *websocket.Conn) {
-	if s.broadcaster == nil {
+	s.mu.Lock()
+	viewerID := fmt.Sprintf("viewer-%d", s.viewerID)
+	s.viewerID++
+	s.connToViewer[conn] = viewerID
+	s.mu.Unlock()
+
+	if err := s.room.RegisterViewer(viewerID, conn); err != nil {
+		s.mu.Lock()
+		delete(s.connToViewer, conn)
+		s.mu.Unlock()
+
 		sendMessage(conn, Message{
 			Type: "error",
-			SDP:  "No active broadcaster",
+			SDP:  "Failed to register viewer",
 		})
 		return
 	}
-
-	s.viewersMutex.Lock()
-	s.viewers[conn] = true
-	s.viewersMutex.Unlock()
-	log.Println("New viewer registered")
+	log.Printf("Viewer %s registered", viewerID)
 }
 
 func (s *Server) handleViewerOffer(conn *websocket.Conn, sdp string) {
-	s.viewersMutex.RLock()
-	_, exists := s.viewers[conn]
-	s.viewersMutex.RUnlock()
+	// Find viewerID for this connection
+	s.mu.RLock()
+	viewerID := s.findViewerID(conn)
+	s.mu.RUnlock()
 
-	if !exists {
+	if viewerID == "" {
 		sendMessage(conn, Message{
 			Type: "error",
-			SDP:  "Not registered as viewer",
+			SDP:  "Viewer not registered",
 		})
 		return
 	}
 
-	s.viewerSDPChan <- sdp
-	answer := <-s.viewerSDPChan // Wait for answer from main process
+	// Decode the base64-encoded SDP
+	var offer webrtc.SessionDescription
+	if err := utils.Decode(sdp, &offer); err != nil {
+		sendMessage(conn, Message{
+			Type: "error",
+			SDP:  fmt.Sprintf("Failed to decode SDP: %v", err),
+		})
+		return
+	}
+
+	answer, err := s.room.HandleViewerOffer(viewerID, offer.SDP)
+	if err != nil {
+		sendMessage(conn, Message{
+			Type: "error",
+			SDP:  fmt.Sprintf("Failed to handle viewer offer: %v", err),
+		})
+		return
+	}
+
+	// Encode the answer before sending
+	encodedAnswer := utils.Encode(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  answer,
+	})
 
 	sendMessage(conn, Message{
 		Type: ServerViewerAnswer,
-		SDP:  answer,
+		SDP:  encodedAnswer,
 	})
 }
 
 func (s *Server) handleDisconnect(conn *websocket.Conn) {
-	if conn == s.broadcaster {
-		s.broadcaster = nil
-		log.Println("Broadcaster disconnected")
-	} else {
-		s.viewersMutex.Lock()
-		delete(s.viewers, conn)
-		s.viewersMutex.Unlock()
-		log.Println("Viewer disconnected")
+	// Check if this is the broadcaster
+	if s.room.IsBroadcasterConn(conn) {
+		s.room.HandleBroadcasterDisconnect()
+		return
+	}
+
+	// Check if this is a viewer
+	if viewerID := s.findViewerID(conn); viewerID != "" {
+		s.room.RemoveViewer(viewerID)
+		s.mu.Lock()
+		delete(s.connToViewer, conn)
+		s.mu.Unlock()
 	}
 }
 
-func (s *Server) GetBroadcasterSDPChan() chan string {
-	return s.broadcasterSDPChan
-}
-
-func (s *Server) GetViewerSDPChan() chan string {
-	return s.viewerSDPChan
+func (s *Server) findViewerID(conn *websocket.Conn) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.connToViewer[conn]
 }
 
 func sendMessage(conn *websocket.Conn, msg Message) {
