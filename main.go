@@ -20,6 +20,16 @@ func main() {
 
 	// Create and start signaling server
 	sigServer := signaling.NewServer(cfg.Port)
+
+	// Create default room
+	room, err := sigServer.GetRoomManager().CreateRoom("default")
+	if err != nil {
+		log.Fatalf("Failed to create default room: %v", err)
+	}
+	// Set as active room
+	sigServer.SetActiveRoom(room)
+
+	// Start server
 	go func() {
 		if err := sigServer.Start(); err != nil {
 			log.Fatalf("Failed to start signaling server: %v", err)
@@ -33,7 +43,7 @@ func main() {
 	}
 	defer broadcaster.Close()
 
-	// Get channels for SDP communication from default room
+	// Get channels for SDP communication
 	broadcasterSDPChan := sigServer.GetBroadcasterSDPChan()
 	viewerSDPChan := sigServer.GetViewerSDPChan()
 
@@ -58,7 +68,24 @@ func main() {
 	}
 
 	// Handle viewer connections in a separate goroutine
-	go handleViewers(cfg.StunURL, viewerSDPChan, localTrack)
+	go func() {
+		for {
+			log.Println("\nWaiting for viewer offer...")
+			viewerOffer := webrtc.SessionDescription{}
+			if err := utils.Decode(<-viewerSDPChan, &viewerOffer); err != nil {
+				log.Printf("Failed to decode viewer offer: %v", err)
+				continue
+			}
+
+			viewer := stream.NewViewer(cfg.StunURL)
+			answer, err := viewer.Start(viewerOffer, localTrack)
+			if err != nil {
+				log.Printf("Failed to start viewer: %v", err)
+				continue
+			}
+			viewerSDPChan <- answer // Send answer back through channel
+		}
+	}()
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
@@ -66,23 +93,5 @@ func main() {
 	<-sigChan
 
 	log.Println("Shutting down...")
-}
-
-func handleViewers(stunURL string, viewerSDPChan chan string, localTrack *webrtc.TrackLocalStaticRTP) {
-	for {
-		log.Println("\nWaiting for viewer offer...")
-		viewerOffer := webrtc.SessionDescription{}
-		if err := utils.Decode(<-viewerSDPChan, &viewerOffer); err != nil {
-			log.Printf("Failed to decode viewer offer: %v", err)
-			continue
-		}
-
-		viewer := stream.NewViewer(stunURL)
-		answer, err := viewer.Start(viewerOffer, localTrack)
-		if err != nil {
-			log.Printf("Failed to start viewer: %v", err)
-			continue
-		}
-		viewerSDPChan <- answer // Send answer back through channel
-	}
+	sigServer.GetRoomManager().DeleteRoom("default")
 }

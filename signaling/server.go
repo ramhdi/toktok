@@ -32,6 +32,8 @@ type Server struct {
 	upgrader websocket.Upgrader
 	rooms    *RoomManager
 	port     int
+	// Reference to active room for backward compatibility
+	activeRoom *Room
 }
 
 func NewServer(port int) *Server {
@@ -54,6 +56,14 @@ func (s *Server) Start() error {
 	addr := fmt.Sprintf(":%d", s.port)
 	log.Printf("Starting server on %s", addr)
 	return http.ListenAndServe(addr, nil)
+}
+
+func (s *Server) GetRoomManager() *RoomManager {
+	return s.rooms
+}
+
+func (s *Server) SetActiveRoom(room *Room) {
+	s.activeRoom = room
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +90,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMessage(conn *websocket.Conn, msg *Message) {
+	if s.activeRoom == nil {
+		sendMessage(conn, Message{
+			Type: "error",
+			SDP:  "No active room available",
+		})
+		return
+	}
+
 	switch msg.Type {
 	case BroadcasterRegister:
 		s.handleBroadcasterRegister(conn)
@@ -99,16 +117,7 @@ func (s *Server) handleMessage(conn *websocket.Conn, msg *Message) {
 }
 
 func (s *Server) handleBroadcasterRegister(conn *websocket.Conn) {
-	room, err := s.rooms.GetDefaultRoom()
-	if err != nil {
-		sendMessage(conn, Message{
-			Type: "error",
-			SDP:  "Failed to get default room",
-		})
-		return
-	}
-
-	if err := room.SetBroadcaster(conn); err != nil {
+	if err := s.activeRoom.SetBroadcaster(conn); err != nil {
 		sendMessage(conn, Message{
 			Type: "error",
 			SDP:  "Broadcaster already exists",
@@ -116,21 +125,12 @@ func (s *Server) handleBroadcasterRegister(conn *websocket.Conn) {
 		return
 	}
 
-	log.Println("Broadcaster registered in default room")
+	log.Println("Broadcaster registered")
 }
 
 func (s *Server) handleBroadcasterOffer(conn *websocket.Conn, sdp string) {
-	room, err := s.rooms.GetDefaultRoom()
-	if err != nil {
-		sendMessage(conn, Message{
-			Type: "error",
-			SDP:  "Failed to get default room",
-		})
-		return
-	}
-
-	room.BroadcasterChan <- sdp
-	answer := <-room.BroadcasterChan
+	s.activeRoom.BroadcasterChan <- sdp
+	answer := <-s.activeRoom.BroadcasterChan
 
 	sendMessage(conn, Message{
 		Type: ServerBroadcasterAnswer,
@@ -139,16 +139,7 @@ func (s *Server) handleBroadcasterOffer(conn *websocket.Conn, sdp string) {
 }
 
 func (s *Server) handleViewerRegister(conn *websocket.Conn) {
-	room, err := s.rooms.GetDefaultRoom()
-	if err != nil {
-		sendMessage(conn, Message{
-			Type: "error",
-			SDP:  "Failed to get default room",
-		})
-		return
-	}
-
-	if err := room.AddViewer(conn); err != nil {
+	if err := s.activeRoom.AddViewer(conn); err != nil {
 		sendMessage(conn, Message{
 			Type: "error",
 			SDP:  err.Error(),
@@ -156,21 +147,12 @@ func (s *Server) handleViewerRegister(conn *websocket.Conn) {
 		return
 	}
 
-	log.Println("New viewer registered in default room")
+	log.Println("New viewer registered")
 }
 
 func (s *Server) handleViewerOffer(conn *websocket.Conn, sdp string) {
-	room, err := s.rooms.GetDefaultRoom()
-	if err != nil {
-		sendMessage(conn, Message{
-			Type: "error",
-			SDP:  "Failed to get default room",
-		})
-		return
-	}
-
-	room.ViewerChan <- sdp
-	answer := <-room.ViewerChan
+	s.activeRoom.ViewerChan <- sdp
+	answer := <-s.activeRoom.ViewerChan
 
 	sendMessage(conn, Message{
 		Type: ServerViewerAnswer,
@@ -179,23 +161,17 @@ func (s *Server) handleViewerOffer(conn *websocket.Conn, sdp string) {
 }
 
 func (s *Server) handleDisconnect(conn *websocket.Conn) {
-	room, err := s.rooms.GetDefaultRoom()
-	if err != nil {
-		return
+	if s.activeRoom != nil {
+		s.activeRoom.RemoveViewer(conn)
 	}
-
-	room.RemoveViewer(conn)
-	s.rooms.DeleteRoom("default") // This will handle broadcaster disconnection
 }
 
 func (s *Server) GetBroadcasterSDPChan() chan string {
-	room, _ := s.rooms.GetDefaultRoom()
-	return room.BroadcasterChan
+	return s.activeRoom.BroadcasterChan
 }
 
 func (s *Server) GetViewerSDPChan() chan string {
-	room, _ := s.rooms.GetDefaultRoom()
-	return room.ViewerChan
+	return s.activeRoom.ViewerChan
 }
 
 func sendMessage(conn *websocket.Conn, msg Message) {

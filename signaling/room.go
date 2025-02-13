@@ -162,19 +162,3 @@ func (rm *RoomManager) DeleteRoom(id string) {
 		delete(rm.rooms, id)
 	}
 }
-
-// For the initial single-room implementation
-func (rm *RoomManager) GetDefaultRoom() (*Room, error) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	// Create default room if it doesn't exist
-	const defaultRoomID = "default"
-	if room, exists := rm.rooms[defaultRoomID]; exists {
-		return room, nil
-	}
-
-	room := NewRoom(defaultRoomID)
-	rm.rooms[defaultRoomID] = room
-	return room, nil
-}
