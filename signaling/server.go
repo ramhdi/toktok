@@ -90,14 +90,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMessage(conn *websocket.Conn, msg *Message) {
-	if s.activeRoom == nil {
-		sendMessage(conn, Message{
-			Type: "error",
-			SDP:  "No active room available",
-		})
-		return
-	}
-
 	switch msg.Type {
 	case BroadcasterRegister:
 		s.handleBroadcasterRegister(conn)
@@ -117,7 +109,16 @@ func (s *Server) handleMessage(conn *websocket.Conn, msg *Message) {
 }
 
 func (s *Server) handleBroadcasterRegister(conn *websocket.Conn) {
-	if err := s.activeRoom.SetBroadcaster(conn); err != nil {
+	room, err := s.rooms.GetRoom("default")
+	if err != nil {
+		sendMessage(conn, Message{
+			Type: "error",
+			SDP:  "Room not found",
+		})
+		return
+	}
+
+	if err := room.SetBroadcaster(conn); err != nil {
 		sendMessage(conn, Message{
 			Type: "error",
 			SDP:  "Broadcaster already exists",
@@ -129,8 +130,17 @@ func (s *Server) handleBroadcasterRegister(conn *websocket.Conn) {
 }
 
 func (s *Server) handleBroadcasterOffer(conn *websocket.Conn, sdp string) {
-	s.activeRoom.BroadcasterChan <- sdp
-	answer := <-s.activeRoom.BroadcasterChan
+	room, err := s.rooms.GetRoom("default")
+	if err != nil {
+		sendMessage(conn, Message{
+			Type: "error",
+			SDP:  "Room not found",
+		})
+		return
+	}
+
+	room.BroadcasterChan <- sdp
+	answer := <-room.BroadcasterChan
 
 	sendMessage(conn, Message{
 		Type: ServerBroadcasterAnswer,
@@ -139,7 +149,16 @@ func (s *Server) handleBroadcasterOffer(conn *websocket.Conn, sdp string) {
 }
 
 func (s *Server) handleViewerRegister(conn *websocket.Conn) {
-	if err := s.activeRoom.AddViewer(conn); err != nil {
+	room, err := s.rooms.GetRoom("default")
+	if err != nil {
+		sendMessage(conn, Message{
+			Type: "error",
+			SDP:  "Room not found",
+		})
+		return
+	}
+
+	if err := room.AddViewer(conn); err != nil {
 		sendMessage(conn, Message{
 			Type: "error",
 			SDP:  err.Error(),
@@ -151,8 +170,17 @@ func (s *Server) handleViewerRegister(conn *websocket.Conn) {
 }
 
 func (s *Server) handleViewerOffer(conn *websocket.Conn, sdp string) {
-	s.activeRoom.ViewerChan <- sdp
-	answer := <-s.activeRoom.ViewerChan
+	room, err := s.rooms.GetRoom("default")
+	if err != nil {
+		sendMessage(conn, Message{
+			Type: "error",
+			SDP:  "Room not found",
+		})
+		return
+	}
+
+	room.ViewerChan <- sdp
+	answer := <-room.ViewerChan
 
 	sendMessage(conn, Message{
 		Type: ServerViewerAnswer,
